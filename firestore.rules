@@ -1,0 +1,176 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - name: string (required)
+    //   - email: string (required, format: email)
+    //   - role: string (required, enum: ['admin', 'user'])
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: projects
+    // Document ID: {projectId}
+    // Fields:
+    //   - name: string (required, size < 100)
+    //   - domain: string (required, size < 255)
+    //   - urls: list (required, size < 100)
+    //   - checkFrequency: string (required, enum: ['hourly', 'daily', 'weekly'])
+    //   - lastChecked: timestamp (optional)
+    //   - createdAt: timestamp (required)
+    //   - userId: string (required, immutable)
+    //
+    // Collection: snapshots
+    // Document ID: {snapshotId}
+    // Fields:
+    //   - projectId: string (required, immutable)
+    //   - url: string (required, size < 2048)
+    //   - metadata: map (required)
+    //   - isBaseline: bool (required)
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: changes
+    // Document ID: {changeId}
+    // Fields:
+    //   - projectId: string (required, immutable)
+    //   - url: string (required, size < 2048)
+    //   - type: string (required, enum: ['SEO', 'Content', 'Structure', 'Links', 'Images', 'Status'])
+    //   - field: string (required, size < 100)
+    //   - oldValue: any (optional)
+    //   - newValue: any (optional)
+    //   - criticality: string (required, enum: ['Critical', 'High', 'Medium', 'Low'])
+    //   - timestamp: timestamp (required)
+    //   - isViewed: bool (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "zdarkdelux@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isRecent(time) {
+      return time is timestamp && math.abs(request.time.toMillis() - time.toMillis()) < 5 * 60 * 1000;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return hasRequiredFields(['name', 'email', 'role', 'createdAt']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             isValidEmail(data.email) &&
+             data.role in ['admin', 'user'] &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidProject(data) {
+      return hasRequiredFields(['name', 'domain', 'urls', 'checkFrequency', 'createdAt', 'userId']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.domain is string && data.domain.size() > 0 && data.domain.size() < 255 &&
+             data.urls is list && data.urls.size() <= 100 &&
+             data.checkFrequency in ['hourly', 'daily', 'weekly'] &&
+             data.createdAt is timestamp &&
+             data.userId is string;
+    }
+
+    function isValidSnapshot(data) {
+      return hasRequiredFields(['projectId', 'url', 'metadata', 'isBaseline', 'createdAt']) &&
+             data.projectId is string &&
+             data.url is string && data.url.size() < 2048 &&
+             data.metadata is map &&
+             data.isBaseline is bool &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidChange(data) {
+      return hasRequiredFields(['projectId', 'url', 'type', 'field', 'criticality', 'timestamp', 'isViewed', 'userId']) &&
+             data.projectId is string &&
+             data.url is string && data.url.size() < 2048 &&
+             data.type in ['SEO', 'Content', 'Structure', 'Links', 'Images', 'Status'] &&
+             data.field is string && data.field.size() < 100 &&
+             data.criticality in ['Critical', 'High', 'Medium', 'Low'] &&
+             data.timestamp is timestamp &&
+             data.isViewed is bool &&
+             data.userId is string;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && isValidUser(request.resource.data) && 
+                    (isOwner(userId) && request.resource.data.role == 'user' || isAdmin());
+      allow update: if isAuthenticated() && isValidUser(request.resource.data) && 
+                    (isOwner(userId) && request.resource.data.role == resource.data.role || isAdmin());
+      allow delete: if isAdmin();
+    }
+
+    match /projects/{projectId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidProject(request.resource.data) && 
+                    (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isAuthenticated() && isValidProject(request.resource.data) && 
+                    (resource.data.userId == request.auth.uid || isAdmin()) &&
+                    request.resource.data.userId == resource.data.userId;
+      allow delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    match /snapshots/{snapshotId} {
+      function canAccessProject(pId) {
+        return get(/databases/$(database)/documents/projects/$(pId)).data.userId == request.auth.uid || isAdmin();
+      }
+
+      allow read: if isAuthenticated() && canAccessProject(resource.data.projectId);
+      allow create: if isAuthenticated() && isValidSnapshot(request.resource.data) && canAccessProject(request.resource.data.projectId);
+      allow update: if isAuthenticated() && isValidSnapshot(request.resource.data) && canAccessProject(resource.data.projectId) &&
+                    request.resource.data.projectId == resource.data.projectId;
+      allow delete: if isAuthenticated() && canAccessProject(resource.data.projectId);
+    }
+
+    match /changes/{changeId} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidChange(request.resource.data) && (request.resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if isAuthenticated() && isValidChange(request.resource.data) && (resource.data.userId == request.auth.uid || isAdmin()) && areImmutableFieldsUnchanged(['projectId', 'url', 'timestamp', 'userId']);
+      allow delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
